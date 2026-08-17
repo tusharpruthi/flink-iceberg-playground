@@ -1,0 +1,28 @@
+# Local playground: Postgres + MinIO + an Iceberg REST catalog, all from docker/docker-compose.yml.
+source:
+  type: postgres
+  host: ${POSTGRES_HOST:localhost}
+  port: ${POSTGRES_PORT:55432}
+  database: ${POSTGRES_DATABASE:playground}
+  schema: ${POSTGRES_SCHEMA:public}
+  username: ${POSTGRES_USERNAME:playground}
+  password: ${POSTGRES_PASSWORD:playground}
+  replicationSlotName: ${POSTGRES_SLOT_NAME:iceberg_playground_slot}
+  publicationName: ${POSTGRES_PUBLICATION_NAME:iceberg_playground_pub}
+  tables: ${POSTGRES_TABLES:pgbench_accounts,pgbench_branches,pgbench_tellers}
+
+catalog:
+  type: rest
+  catalogName: ${ICEBERG_CATALOG_NAME:playground_catalog}
+  # For a REST catalog this is an S3 path the server resolves against directly (unlike Polaris,
+  # which owns the warehouse location server-side under a catalog name it created).
+  warehousePath: ${ICEBERG_WAREHOUSE:s3://flink-iceberg-playground-warehouse/warehouse}
+  restUri: ${ICEBERG_REST_URI:http://localhost:58181}
+  # The local REST catalog server runs without auth, so this is intentionally blank —
+  # RestIcebergCatalogProvider only sends OAuth2 credentials when one is configured.
+  restCredential: ${ICEBERG_REST_CREDENTIAL:}
+  s3Endpoint: ${MINIO_ENDPOINT:http://localhost:59000}
+  s3AccessKeyId: ${MINIO_ACCESS_KEY:minioadmin}
+  s3SecretAccessKey: ${MINIO_SECRET_KEY:minioadmin}
+  region: ${AWS_REGION:us-east-1}
+  pathStyleAccess: true

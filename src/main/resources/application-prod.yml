@@ -1,0 +1,20 @@
+# Production: Postgres RDS + AWS Glue + real S3. All values come from the environment, nothing
+# is hardcoded so the same jar can be promoted across regions/accounts.
+source:
+  type: postgres
+  host: ${POSTGRES_HOST}
+  port: ${POSTGRES_PORT:5432}
+  database: ${POSTGRES_DATABASE}
+  schema: ${POSTGRES_SCHEMA:public}
+  username: ${POSTGRES_USERNAME}
+  password: ${POSTGRES_PASSWORD}
+  replicationSlotName: ${POSTGRES_SLOT_NAME}
+  publicationName: ${POSTGRES_PUBLICATION_NAME}
+  tables: ${POSTGRES_TABLES}
+
+catalog:
+  type: glue
+  catalogName: ${ICEBERG_CATALOG_NAME:glue_catalog}
+  warehousePath: ${ICEBERG_WAREHOUSE}
+  region: ${AWS_REGION}
+  pathStyleAccess: false

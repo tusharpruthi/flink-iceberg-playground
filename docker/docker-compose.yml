@@ -1,0 +1,164 @@
+name: flink-iceberg-playground
+
+networks:
+  default:
+    name: flink-iceberg-playground-net
+
+volumes:
+  postgres-data:
+  minio-data:
+
+services:
+  postgres:
+    # Official postgres image + wal2json installed from its own apt repo — see
+    # docker/postgres/Dockerfile. Our WAL reader depends on wal2json's JSON change payloads.
+    build: ./postgres
+    container_name: flink-iceberg-playground-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: playground
+      POSTGRES_PASSWORD: playground
+      POSTGRES_DB: playground
+    command:
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+    ports:
+      - "55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U playground -d playground"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgbench-loadgen:
+    # Standard pgbench schema/data (no custom tables), trickled in on a timer so the CDC
+    # pipeline always has a small, steady stream of WAL activity to sync — not a burst load
+    # test. pgbench ships in the base postgres image already, so this reuses it as-is.
+    image: postgres:16
+    container_name: flink-iceberg-playground-pgbench-loadgen
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: playground
+      POSTGRES_PASSWORD: playground
+      POSTGRES_DB: playground
+      INTERVAL_SECONDS: "60"
+      TRANSACTIONS_PER_TICK: "5"
+    entrypoint: ["/bin/bash", "/loadgen/entrypoint.sh"]
+    volumes:
+      - ./loadgen/entrypoint.sh:/loadgen/entrypoint.sh:ro
+
+  minio:
+    image: minio/minio:latest
+    container_name: flink-iceberg-playground-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: flink-iceberg-playground-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/flink-iceberg-playground-warehouse
+      "
+
+  iceberg-rest:
+    # Iceberg's own reference REST catalog server. Apache Polaris was tried first, but its
+    # server-side S3 client currently resolves MinIO paths in virtual-hosted style
+    # (bucket.host) regardless of path-style config, which MinIO rejects — a Polaris/MinIO
+    # interop gap, not something fixable from this app's config. This image is the one most
+    # Iceberg+MinIO tutorials use locally for exactly that reason. Our app only sees
+    # `catalog.type: rest`, so swapping the server here never touches application code —
+    # dropping Polaris back in later, or pointing at AWS Glue in prod, is a config change.
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: flink-iceberg-playground-rest-catalog
+    restart: unless-stopped
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://flink-iceberg-playground-warehouse/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "58181:8181"
+    healthcheck:
+      # No curl/wget in this image — use bash's /dev/tcp to check the port is accepting requests.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8181 && printf 'GET /v1/config HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  trino:
+    # Ad-hoc SQL over the Iceberg tables without the classpath gymnastics Flink's SQL Client
+    # needs (hadoop-mapreduce-client-core on /opt/flink/lib, region/result-mode workarounds,
+    # etc.) — Trino talks to the same REST catalog + MinIO directly out of the box.
+    image: trinodb/trino:latest
+    container_name: flink-iceberg-playground-trino
+    restart: unless-stopped
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+    ports:
+      - "58080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  jobmanager:
+    image: flink:1.20.0-java11
+    container_name: flink-iceberg-playground-jobmanager
+    restart: unless-stopped
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+    ports:
+      - "58082:8081"
+
+  taskmanager:
+    image: flink:1.20.0-java11
+    container_name: flink-iceberg-playground-taskmanager
+    restart: unless-stopped
+    command: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
